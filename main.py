@@ -17,6 +17,8 @@ from markdownify import markdownify as md
 from urllib.parse import unquote, urlparse, parse_qs
 from tqdm import tqdm
 import json
+from bs4.element import Tag
+import html2text
 
 def insert_new_line(soup, element, num_breaks):
     """
@@ -72,41 +74,54 @@ def get_valid_filename(s):
     s = str(s).strip().replace(' ', '_')
     return re.sub(r'(?u)[^-\w_]', '', s)
 
+def get_session(cookies=None):
+    user_agents = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    headers = {
+        'User-Agent': user_agents,
+        'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8',
+        'Cookie': cookies
+    }
+    session = requests.Session()
+    session.headers.update(headers)
+    return session
 
-def judge_zhihu_type(url, cookies=None, session=None, hexo_uploader=False):
+# judge_zhihu_type
+
+def judge_zhihu_type(url:str, ):
+    pass
+
+
+def handle_zhihu(url, cookies="", session=None, hexo_uploader=False):
     """
     判断url类型
     """
-    if session is None:
-        session = requests.Session()
-        user_agents = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        headers = {
-            'User-Agent': user_agents,
-            'Accept-Language': 'en,zh-CN;q=0.9,zh;q=0.8',
-            'Cookie': cookies
-        }
-        session.headers.update(headers)
-
+    if not session:
+        session = get_session(cookies=cookies)
+    content = download_http_content(url=url, session=session)
+    
+    if not content:
+        raise Exception(f"未获取到内容{url}")
+    
     if url.find("column") != -1:
         # 如果是专栏
-        title = parse_zhihu_column(url, session, hexo_uploader)
+        title = parse_zhihu_column(content, session=session, hexo_uploader=hexo_uploader)
 
     elif url.find("answer") != -1:
         # 如果是回答
-        title = parse_zhihu_answer(url, session, hexo_uploader)
+        title = parse_zhihu_answer(content, hexo_uploader)
 
     elif url.find("zvideo") != -1:
         # 如果是视频
-        title = parse_zhihu_zvideo(url, session, hexo_uploader)
+        title = parse_zhihu_zvideo(content,hexo_uploader)
 
     else:
         # 如果是单篇文章
-        title = parse_zhihu_article(url, session, hexo_uploader)
+        title = parse_zhihu_article(content, url, hexo_uploader)
 
     return title
 
 
-def save_and_transform(title_element, content_element, author, url, hexo_uploader, soup, date=None):
+def save_and_transform(title_element, content_element:Tag, author, url, hexo_uploader, soup:BeautifulSoup, date=None):
     """
     转化并保存为 Markdown 格式文件
     """
@@ -122,136 +137,150 @@ def save_and_transform(title_element, content_element, author, url, hexo_uploade
     markdown_title = get_valid_filename(title)
 
     if date:
-        markdown_title = f"({date}){markdown_title}_{author}"
+        markdown_title = f"{date}-{markdown_title}-{author}"
     else:
         markdown_title = f"{markdown_title}_{author}"
+    
+    # 让contentelement有个根结点
+    body = content_element.select_one("body")
+    if body is None:
+        body = soup.new_tag("body")
+        body.append(content_element)
+        content_element = body
+    
+    # 将 css 样式移除
+    for style_tag in content_element.find_all("style"):
+        style_tag.decompose()
 
-    if content_element is not None:
-        # 将 css 样式移除
-        for style_tag in content_element.find_all("style"):
-            style_tag.decompose()
+    for img_lazy in content_element.find_all("img", class_=lambda x: 'lazy' in x if x else True):
+        img_lazy.decompose()
 
-        for img_lazy in content_element.find_all("img", class_=lambda x: 'lazy' in x if x else True):
-            img_lazy.decompose()
+    # 处理内容中的标题
+    for header in content_element.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+        header_level = int(header.name[1])  # 从标签名中获取标题级别（例如，'h2' -> 2）
+        header_text = header.get_text(strip=True)  # 提取标题文本
+        # 转换为 Markdown 格式的标题
+        markdown_header = f"{'#' * header_level} {header_text}"
+        insert_new_line(soup, header, 1)
+        header.replace_with(markdown_header)
 
-        # 处理内容中的标题
-        for header in content_element.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-            header_level = int(header.name[1])  # 从标签名中获取标题级别（例如，'h2' -> 2）
-            header_text = header.get_text(strip=True)  # 提取标题文本
-            # 转换为 Markdown 格式的标题
-            markdown_header = f"{'#' * header_level} {header_text}"
-            insert_new_line(soup, header, 1)
-            header.replace_with(markdown_header)
+    # 处理回答中的图片
+    for img in content_element.find_all("img"):
+        if 'src' in img.attrs:
+            img_url = img.attrs['src']
+        else:
+            continue
 
-        # 处理回答中的图片
-        for img in content_element.find_all("img"):
-            if 'src' in img.attrs:
-                img_url = img.attrs['src']
+        img_name = urllib.parse.quote(os.path.basename(img_url))
+        img_path = f"{markdown_title}/{img_name}"
+
+        extensions = ['.jpg', '.png', '.gif']  # 可以在此列表中添加更多的图片格式
+
+        # 如果图片链接中图片后缀后面还有字符串则直接截停
+        for ext in extensions:
+            index = img_path.find(ext)
+            if index != -1:
+                img_path = img_path[:index + len(ext)]
+                break  # 找到第一个匹配的格式后就跳出循环
+
+        img["src"] = img_path
+
+        # 下载图片并保存到本地
+        os.makedirs(os.path.dirname(img_path), exist_ok=True)
+        download_image(img_url, img_path)
+
+        # 在图片后插入换行符
+        insert_new_line(soup, img, 1)
+
+    # 在图例后面加上换行符
+    for figcaption in content_element.find_all("figcaption"):
+        insert_new_line(soup, figcaption, 2)
+
+    # 处理链接
+    for link in content_element.find_all("a"):
+        if 'href' in link.attrs:
+            original_url = link.attrs['href']
+
+            # 解析并解码 URL
+            parsed_url = urlparse(original_url)
+            query_params = parse_qs(parsed_url.query)
+            target_url = query_params.get('target', [original_url])[
+                0]  # 使用原 URL 作为默认值
+            article_url = unquote(target_url)  # 解码 URL
+
+            # 如果没有 data-text 属性，则使用文章链接作为标题
+            if 'data-text' not in link.attrs:
+                article_title = article_url
             else:
-                continue
+                article_title = link.attrs['data-text']
 
-            img_name = urllib.parse.quote(os.path.basename(img_url))
-            img_path = f"{markdown_title}/{img_name}"
+            markdown_link = f"[{article_title}]({article_url})"
 
-            extensions = ['.jpg', '.png', '.gif']  # 可以在此列表中添加更多的图片格式
+            link.replace_with(markdown_link)
 
-            # 如果图片链接中图片后缀后面还有字符串则直接截停
-            for ext in extensions:
-                index = img_path.find(ext)
-                if index != -1:
-                    img_path = img_path[:index + len(ext)]
-                    break  # 找到第一个匹配的格式后就跳出循环
-
-            img["src"] = img_path
-
-            # 下载图片并保存到本地
-            os.makedirs(os.path.dirname(img_path), exist_ok=True)
-            download_image(img_url, img_path)
-
-            # 在图片后插入换行符
-            insert_new_line(soup, img, 1)
-
-        # 在图例后面加上换行符
-        for figcaption in content_element.find_all("figcaption"):
-            insert_new_line(soup, figcaption, 2)
-
-        # 处理链接
-        for link in content_element.find_all("a"):
-            if 'href' in link.attrs:
-                original_url = link.attrs['href']
-
-                # 解析并解码 URL
-                parsed_url = urlparse(original_url)
-                query_params = parse_qs(parsed_url.query)
-                target_url = query_params.get('target', [original_url])[
-                    0]  # 使用原 URL 作为默认值
-                article_url = unquote(target_url)  # 解码 URL
-
-                # 如果没有 data-text 属性，则使用文章链接作为标题
-                if 'data-text' not in link.attrs:
-                    article_title = article_url
-                else:
-                    article_title = link.attrs['data-text']
-
-                markdown_link = f"[{article_title}]({article_url})"
-
-                link.replace_with(markdown_link)
-
-        # 提取并存储数学公式
-        math_formulas = []
-        math_tags = []
-        for math_span in content_element.select("span.ztext-math"):
-            latex_formula = math_span['data-tex']
-            # math_formulas.append(latex_formula)
-            # math_span.replace_with("@@MATH@@")
-            # 使用特殊标记标记位置
-            if latex_formula.find("\\tag") != -1:
-                math_tags.append(latex_formula)
-                insert_new_line(soup, math_span, 1)
-                math_span.replace_with("@@MATH_FORMULA@@")
+    # 提取并存储数学公式
+    math_formulas = []
+    math_tags = []
+    for math_span in content_element.select("span.ztext-math"):
+        latex_formula = str(math_span['data-tex'])
+        # math_formulas.append(latex_formula)
+        # math_span.replace_with("@@MATH@@")
+        # 使用特殊标记标记位置
+        if latex_formula.find("\\tag") != -1:
+            math_tags.append(latex_formula)
+            insert_new_line(soup, math_span, 1)
+            math_span.replace_with("@@MATH_FORMULA@@")
+        elif latex_formula.find("\\begin") != -1:
+            math_tags.append(math_span.parent.getText())
+            math_span.parent.replace_with("@@MATH_FORMULA@@")
+        else:
+            math_formulas.append(latex_formula.strip())
+            math_span.replace_with("@@MATH@@")
+    
+    # 获取文本内容
+    raw_content = content_element.decode_contents().strip()
+    
+    # 转换为 markdown
+    h = html2text.HTML2Text(bodywidth=9999999)
+    md_content = h.handle(raw_content)
+    
+    for x in range(20):
+        md_content = h.handle(raw_content)
+    
+    # 将特殊标记替换为 LaTeX 数学公式
+    for formula in math_formulas:
+        if hexo_uploader:
+            md_content = md_content.replace(
+                "@@MATH@@", "$" + "{% raw %}" + formula + "{% endraw %}" + "$", 1)
+        else:
+            # 如果公式中包含 $ 则不再添加 $ 符号
+            if formula.find('$') != -1:
+                md_content = md_content.replace("@@MATH@@", f"{formula}", 1)
             else:
-                math_formulas.append(latex_formula)
-                math_span.replace_with("@@MATH@@")
+                md_content = md_content.replace("@@MATH@@", f"${formula}$", 1)
 
-        # 获取文本内容
-        content = content_element.decode_contents().strip()
-        # 转换为 markdown
-        content = md(content)
-
-        # 将特殊标记替换为 LaTeX 数学公式
-        for formula in math_formulas:
-            if hexo_uploader:
-                content = content.replace(
-                    "@@MATH@@", "$" + "{% raw %}" + formula + "{% endraw %}" + "$", 1)
+    for formula in math_tags:
+        if hexo_uploader:
+            md_content = md_content.replace(
+                "@@MATH_FORMULA@@",
+                "$$" + "{% raw %}" + formula + "{% endraw %}" + "$$",
+                1,
+            )
+        else:
+            # 如果公式中包含 $ 则不再添加 $ 符号
+            if formula.find("\\begin") != -1:
+                md_content = md_content.replace("@@MATH_FORMULA@@", f"$$\n{formula}\n$$\n", 1)
+            
+            elif formula.find("$") != -1:
+                md_content = md_content.replace(
+                    "@@MATH_FORMULA@@", f"{formula}", 1)
             else:
-                # 如果公式中包含 $ 则不再添加 $ 符号
-                if formula.find('$') != -1:
-                    content = content.replace("@@MATH@@", f"{formula}", 1)
-                else:
-                    content = content.replace("@@MATH@@", f"${formula}$", 1)
-
-        for formula in math_tags:
-            if hexo_uploader:
-                content = content.replace(
-                    "@@MATH\_FORMULA@@",
-                    "$$" + "{% raw %}" + formula + "{% endraw %}" + "$$",
-                    1,
-                )
-            else:
-                # 如果公式中包含 $ 则不再添加 $ 符号
-                if formula.find("$") != -1:
-                    content = content.replace(
-                        "@@MATH\_FORMULA@@", f"{formula}", 1)
-                else:
-                    content = content.replace(
-                        "@@MATH\_FORMULA@@", f"$${formula}$$", 1)
-
-    else:
-        content = ""
-
+                md_content = md_content.replace(
+                    "@@MATH_FORMULA@@", f"$${formula}$$", 1)
+    
     # 转化为 Markdown 格式
-    if content:
-        markdown = f"# {title}\n\n **Author:** [{author}]\n\n **Link:** [{url}]\n\n{content}"
+    if md_content:
+        markdown = f"# {title}\n\n **Author:** [{author}]\n\n **Link:** [{url}]\n\n{md_content}"
     else:
         markdown = f"# {title}\n\n Content is empty."
 
@@ -262,21 +291,11 @@ def save_and_transform(title_element, content_element, author, url, hexo_uploade
     return markdown_title
 
 
-def parse_zhihu_zvideo(url, session, hexo_uploader):
+def parse_zhihu_zvideo(content:str, hexo_uploader):
     """
     解析知乎视频并保存为 Markdown 格式文件
     """
-    try:
-        response = session.get(url)
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as err:
-        print(f"HTTP error occurred: {err}")
-        return None
-    except requests.exceptions.RequestException as err:
-        print(f"Error occurred: {err}")
-        return None
-
-    soup = BeautifulSoup(response.content, "html.parser")
+    soup = BeautifulSoup(content, "html.parser")
     if soup.text.find("有问题，就会有答案打开知乎App在「我的页」右上角打开扫一扫其他扫码方式") != -1:
         print("Cookies are required to access the article.")
         return None
@@ -293,7 +312,7 @@ def parse_zhihu_zvideo(url, session, hexo_uploader):
     else:
         date = "Unknown"
 
-    markdown_title = f"({date}){data['authorName']}_{data['title']}/{data['authorName']}_{data['title']}.mp4"
+    markdown_title = f"{date}-{data['title']}-{data['authorName']}/{data['title']}-{data['authorName']}.mp4"
 
     video_url = None
     script = soup.find('script', id='js-initialData')
@@ -319,21 +338,12 @@ def parse_zhihu_zvideo(url, session, hexo_uploader):
     return markdown_title
 
 
-def parse_zhihu_article(url, session, hexo_uploader):
+def parse_zhihu_article(content:str, url, hexo_uploader):
     """
     解析知乎文章并保存为Markdown格式文件
     """
-    try:
-        response = session.get(url)
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as err:
-        print(f"HTTP error occurred: {err}")
-        return None
-    except requests.exceptions.RequestException as err:
-        print(f"Error occurred: {err}")
-        return None
-
-    soup = BeautifulSoup(response.content, "html.parser")
+    
+    soup = BeautifulSoup(content, "html.parser")
     if soup.text.find("有问题，就会有答案打开知乎App在「我的页」右上角打开扫一扫其他扫码方式") != -1:
         print("Cookies are required to access the article.")
         return None
@@ -345,29 +355,19 @@ def parse_zhihu_article(url, session, hexo_uploader):
     date = get_article_date(soup)
     author = soup.select_one('div.AuthorInfo').find(
         'meta', {'itemprop': 'name'}).get('content')
-
+    
     markdown_title = save_and_transform(
         title_element, content_element, author, url, hexo_uploader, soup, date)
 
     return markdown_title
 
 
-def parse_zhihu_answer(url, session, hexo_uploader):
+def parse_zhihu_answer(content:str, hexo_uploader):
     """
     解析知乎回答并保存为 Markdown 格式文件
     """
-    try:
-        response = session.get(url)
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as err:
-        print(f"HTTP error occurred: {err}")
-        return None
-    except requests.exceptions.RequestException as err:
-        print(f"Error occurred: {err}")
-        return None
-
     # 解析HTML
-    soup = BeautifulSoup(response.content, "html.parser")
+    soup = BeautifulSoup(content, "html.parser")
     if soup.text.find("有问题，就会有答案打开知乎App在「我的页」右上角打开扫一扫其他扫码方式") != -1:
         print("Cookies are required to access the article.")
         return None
@@ -406,22 +406,33 @@ def save_processed_article(filename, article_id):
         file.write(article_id + '\n')
 
 
-def parse_zhihu_column(url, session, hexo_uploader):
+def download_http_content(url, session=None) ->str:
     """
-    解析知乎专栏并保存为 Markdown 格式文件
+    获取url链接的内容
     """
+    # f_path = "runtime/b.html"
+    # with open(f_path, 'r') as f:
+    #     content = f.read()  
+    # return content
+    
+    if not session:
+        session = get_session()
     try:
         response = session.get(url)
         response.raise_for_status()
     except requests.exceptions.HTTPError as err:
-        print(f"HTTP error occurred: {err}")
-        return None
+        raise Exception(f"HTTP error occurred: {err}")
     except requests.exceptions.RequestException as err:
-        print(f"Error occurred: {err}")
-        return None
+        raise Exception(f"Error occurred: {err}")
+    return response.content
 
+def parse_zhihu_column(content:str, session, hexo_uploader):
+    """
+    解析知乎专栏并保存为 Markdown 格式文件
+    """
+    
     # 解析HTML
-    soup = BeautifulSoup(response.content, "html.parser")
+    soup = BeautifulSoup(content, "html.parser")
 
     # 将所有文章放在一个以专栏标题命名的文件夹中
     title = soup.text.split('-')[0].strip()
@@ -461,7 +472,7 @@ def parse_zhihu_column(url, session, hexo_uploader):
                     continue
 
                 video_link = f"https://www.zhihu.com/zvideo/{video_id}"
-                judge_zhihu_type(video_link, None, session, hexo_uploader)
+                handle_zhihu(video_link, cookies="", session=session, hexo_uploader=hexo_uploader)
                 save_processed_article(processed_filename, video_id)
                 progress_bar.update(1)  # 更新进度条
 
@@ -471,7 +482,7 @@ def parse_zhihu_column(url, session, hexo_uploader):
                     continue
 
                 article_link = url_template.format(id=article_id)
-                judge_zhihu_type(article_link, None, session, hexo_uploader)
+                handle_zhihu(article_link, cookies="", session=session, hexo_uploader=hexo_uploader)
                 save_processed_article(processed_filename, article_id)
                 progress_bar.update(1)  # 更新进度条
 
@@ -493,13 +504,13 @@ if __name__ == "__main__":
     # url = "https://www.zhihu.com/question/362131975/answer/2182682685"
 
     # 文章
-    # url = "https://zhuanlan.zhihu.com/p/545645937"
+    # url = "https://zhuanlan.zhihu.com/p/74075915"
 
     # 视频
-    # url = "https://www.zhihu.com/zvideo/1493715983701831680"
+    url = "https://www.zhihu.com/zvideo/1493715983701831680"
 
     # 专栏
-    url = "https://www.zhihu.com/column/c_1104714416238673920"
+    # url = "https://www.zhihu.com/column/c_1104714416238673920"
 
     # hexo_uploader=True 表示在公式前后加上 {% raw %} {% endraw %}，以便 hexo 正确解析
-    judge_zhihu_type(url, cookies, hexo_uploader=False)
+    handle_zhihu(url, cookies)
