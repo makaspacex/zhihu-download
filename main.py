@@ -108,7 +108,7 @@ def handle_zhihu(url, cookies="", session=None, hexo_uploader=False):
 
     elif url.find("answer") != -1:
         # 如果是回答
-        title = parse_zhihu_answer(content, hexo_uploader)
+        title = parse_zhihu_answer(content, url, hexo_uploader)
 
     elif url.find("zvideo") != -1:
         # 如果是视频
@@ -223,6 +223,8 @@ def save_and_transform(title_element, content_element:Tag, author, url, hexo_upl
     math_tags = []
     for math_span in content_element.select("span.ztext-math"):
         latex_formula = str(math_span['data-tex'])
+        if latex_formula.startswith("\["):
+            latex_formula = latex_formula[2:-2]
         # math_formulas.append(latex_formula)
         # math_span.replace_with("@@MATH@@")
         # 使用特殊标记标记位置
@@ -231,7 +233,10 @@ def save_and_transform(title_element, content_element:Tag, author, url, hexo_upl
             insert_new_line(soup, math_span, 1)
             math_span.replace_with("@@MATH_FORMULA@@")
         elif latex_formula.find("\\begin") != -1:
-            math_tags.append(math_span.parent.getText())
+            latex_formula = math_span.parent.getText()
+            if latex_formula.startswith("\["):
+                latex_formula = latex_formula[2:-2]
+            math_tags.append(latex_formula)
             math_span.parent.replace_with("@@MATH_FORMULA@@")
         else:
             math_formulas.append(latex_formula.strip())
@@ -362,7 +367,7 @@ def parse_zhihu_article(content:str, url, hexo_uploader):
     return markdown_title
 
 
-def parse_zhihu_answer(content:str, hexo_uploader):
+def parse_zhihu_answer(content:str, url, hexo_uploader):
     """
     解析知乎回答并保存为 Markdown 格式文件
     """
