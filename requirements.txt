@@ -1,0 +1,8 @@
+beautifulsoup4==4.12.3
+Flask==3.0.3
+Flask-Cors==4.0.1
+html2text==2024.2.26
+markdownify==0.12.1
+requests==2.31.0
+tqdm==4.66.4
+urllib3==2.2.1
